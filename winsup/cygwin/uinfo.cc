@@ -391,12 +391,12 @@ cygheap_user::ontherange (homebodies what, struct passwd *pw)
 	    {
 	      if (ui->usri3_home_dir_drive && *ui->usri3_home_dir_drive)
 		{
-		  sys_wcstombs (homepath_env_buf, NT_MAX_PATH,
+		  sys_wcstombs_path (homepath_env_buf, NT_MAX_PATH,
 				ui->usri3_home_dir_drive);
 		  strcat (homepath_env_buf, "\\");
 		}
 	      else if (ui->usri3_home_dir && *ui->usri3_home_dir)
-		sys_wcstombs (homepath_env_buf, NT_MAX_PATH,
+		sys_wcstombs_path (homepath_env_buf, NT_MAX_PATH,
 			      ui->usri3_home_dir);
 	    }
 	  if (ui)
@@ -406,7 +406,7 @@ cygheap_user::ontherange (homebodies what, struct passwd *pw)
       if (!homepath_env_buf[0]
 	  && get_user_profile_directory (get_windows_id (win_id),
 					 profile, MAX_PATH))
-	sys_wcstombs (homepath_env_buf, NT_MAX_PATH, profile);
+	sys_wcstombs_path (homepath_env_buf, NT_MAX_PATH, profile);
       /* Last fallback: Cygwin root dir. */
       if (!homepath_env_buf[0])
 	cygwin_conv_path (CCP_POSIX_TO_WIN_A | CCP_ABSOLUTE,
@@ -642,6 +642,11 @@ cygheap_pwdgrp::nss_init_line (const char *line)
 		  {
 		    *src |= NSS_SRC_DB;
 		    c += 2;
+		  }
+		else if (NSS_CMP ("db-accurate"))
+		  {
+		    *src |= NSS_SRC_DB | NSS_SRC_DB_ACCURATE;
+		    c += 11;
 		  }
 		else
 		  {
@@ -925,7 +930,7 @@ fetch_from_path (cyg_ldap *pldap, PUSER_INFO_3 ui, cygpsid &sid, PCWSTR str,
 	}
     }
   *w = L'\0';
-  sys_wcstombs_alloc (&ret, HEAP_NOTHEAP, wpath);
+  sys_wcstombs_alloc_path (&ret, HEAP_NOTHEAP, wpath);
   return ret;
 }
 
@@ -993,7 +998,7 @@ cygheap_pwdgrp::get_home (cyg_ldap *pldap, cygpsid &sid, PCWSTR dom,
 	    {
 	      val = pldap->get_string_attribute (L"cygwinHome");
 	      if (val && *val)
-		sys_wcstombs_alloc (&home, HEAP_NOTHEAP, val);
+		sys_wcstombs_alloc_path (&home, HEAP_NOTHEAP, val);
 	    }
 	  break;
 	case NSS_SCHEME_UNIX:
@@ -1001,7 +1006,7 @@ cygheap_pwdgrp::get_home (cyg_ldap *pldap, cygpsid &sid, PCWSTR dom,
 	    {
 	      val = pldap->get_string_attribute (L"unixHomeDirectory");
 	      if (val && *val)
-		sys_wcstombs_alloc (&home, HEAP_NOTHEAP, val);
+		sys_wcstombs_alloc_path (&home, HEAP_NOTHEAP, val);
 	    }
 	  break;
 	case NSS_SCHEME_DESC:
@@ -1026,7 +1031,7 @@ cygheap_pwdgrp::get_home (cyg_ldap *pldap, cygpsid &sid, PCWSTR dom,
 		    home = (char *)
 			   cygwin_create_path (CCP_WIN_W_TO_POSIX, val);
 		  else
-		    sys_wcstombs_alloc (&home, HEAP_NOTHEAP, val);
+		    sys_wcstombs_alloc_path (&home, HEAP_NOTHEAP, val);
 		}
 	    }
 	  break;
@@ -1096,7 +1101,7 @@ cygheap_pwdgrp::get_shell (cyg_ldap *pldap, cygpsid &sid, PCWSTR dom,
 	    {
 	      val = pldap->get_string_attribute (L"cygwinShell");
 	      if (val && *val)
-		sys_wcstombs_alloc (&shell, HEAP_NOTHEAP, val);
+		sys_wcstombs_alloc_path (&shell, HEAP_NOTHEAP, val);
 	    }
 	  break;
 	case NSS_SCHEME_UNIX:
@@ -1104,7 +1109,7 @@ cygheap_pwdgrp::get_shell (cyg_ldap *pldap, cygpsid &sid, PCWSTR dom,
 	    {
 	      val = pldap->get_string_attribute (L"loginShell");
 	      if (val && *val)
-		sys_wcstombs_alloc (&shell, HEAP_NOTHEAP, val);
+		sys_wcstombs_alloc_path (&shell, HEAP_NOTHEAP, val);
 	    }
 	  break;
 	case NSS_SCHEME_DESC:
@@ -1129,7 +1134,7 @@ cygheap_pwdgrp::get_shell (cyg_ldap *pldap, cygpsid &sid, PCWSTR dom,
 		    shell = (char *)
 			    cygwin_create_path (CCP_WIN_W_TO_POSIX, val);
 		  else
-		    sys_wcstombs_alloc (&shell, HEAP_NOTHEAP, val);
+		    sys_wcstombs_alloc_path (&shell, HEAP_NOTHEAP, val);
 		}
 	    }
 	  break;
@@ -1958,6 +1963,7 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
   gid_t gid = ILLEGAL_GID;
   bool is_domain_account = true;
   PCWSTR domain = NULL;
+  bool get_default_group_from_current_user_token = false;
   char *shell = NULL;
   char *home = NULL;
   char *gecos = NULL;
@@ -2472,9 +2478,19 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
 	    uid = posix_offset + sid_sub_auth_rid (sid);
 	  if (!is_group () && acc_type == SidTypeUser)
 	    {
-	      /* Default primary group.  Make the educated guess that the user
-		 is in group "Domain Users" or "None". */
-	      gid = posix_offset + DOMAIN_GROUP_RID_USERS;
+	      /* Default primary group.  If the sid is the current user, and
+		 we are not configured for accurate mode, fetch
+		 the default group from the current user token, otherwise make
+		 the educated guess that the user is in group "Domain Users"
+		 or "None". */
+	      if (!cygheap->pg.nss_grp_db_accurate() && sid == cygheap->user.sid ())
+		{
+		  get_default_group_from_current_user_token = true;
+		  gid = posix_offset
+			+ sid_sub_auth_rid (cygheap->user.groups.pgsid);
+		}
+	      else
+		gid = posix_offset + DOMAIN_GROUP_RID_USERS;
 	    }
 
 	  if (is_domain_account)
@@ -2482,9 +2498,11 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, bool ugid_caching, cy
 	      /* Skip this when creating group entries and for non-users. */
 	      if (is_group() || acc_type != SidTypeUser)
 		break;
-	      /* Fetch primary group from AD and overwrite the one we
-		 just guessed above. */
-	      if (cldap->fetch_ad_account (sid, false, domain))
+	      /* For the current user we got correctly cased username and
+		 the primary group via process token.  For any other user
+		 we fetch it from AD and overwrite it. */
+	      if (!get_default_group_from_current_user_token
+		  && cldap->fetch_ad_account (sid, false, domain))
 		{
 		  if ((val = cldap->get_account_name ()))
 		    wcscpy (name, val);

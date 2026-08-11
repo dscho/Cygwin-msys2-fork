@@ -653,7 +653,8 @@ path_conv::check (const UNICODE_STRING *src, unsigned opt,
   char *path = tp.c_get ();
 
   user_shared->warned_msdos = true;
-  sys_wcstombs (path, NT_MAX_PATH, src->Buffer, src->Length / sizeof (WCHAR));
+  sys_wcstombs_path (path, NT_MAX_PATH,
+		  src->Buffer, src->Length / sizeof (WCHAR));
   path_conv::check (path, opt, suffixes);
 }
 
@@ -2014,7 +2015,7 @@ symlink_native (const char *oldpath, path_conv &win32_newpath)
   path_conv win32_oldpath;
   PUNICODE_STRING final_oldpath, final_newpath;
   UNICODE_STRING final_oldpath_buf;
-  DWORD flags;
+  DWORD flags = 0;
 
   if (resolve_symlink_target (oldpath, win32_newpath, win32_oldpath))
     final_oldpath = win32_oldpath.get_nt_native_path ();
@@ -2076,14 +2077,39 @@ symlink_native (const char *oldpath, path_conv &win32_newpath)
 	    wcpcpy (e_old, c_old);
 	}
     }
-  /* If the symlink target doesn't exist, don't create native symlink.
-     Otherwise the directory flag in the symlink is potentially wrong
-     when the target comes into existence, and native tools will fail.
-     This is so screwball. This is no problem on AFS, fortunately. */
-  if (!win32_oldpath.exists () && !win32_oldpath.fs_is_afs ())
+
+  /* The directory flag in the symlink must match the target type,
+     otherwise native tools will fail (fortunately this is no problem
+     on AFS). Do our best to guess the symlink type correctly. */
+  if (win32_oldpath.exists () || win32_oldpath.fs_is_afs ())
     {
-      SetLastError (ERROR_FILE_NOT_FOUND);
-      return -1;
+      /* If the target exists (or on AFS), check the target type. Note
+	 that this may still be wrong if the target is changed after
+	 creating the symlink (e.g. in bulk operations such as rsync,
+	 unpacking archives or VCS checkouts). */
+      if (win32_oldpath.isdir ())
+        flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+    }
+  else
+    {
+      if (allow_winsymlinks == WSYM_nativestrict)
+	{
+	  /* In nativestrict mode, if the target does not exist, use
+	     trailing '/' in the target path as hint to create a
+	     directory symlink. */
+	  ssize_t len = strlen(oldpath);
+	  if (len && isdirsep(oldpath[len - 1]))
+            flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+	}
+      else
+	{
+	 /* In native mode, if the target does not exist, fall back
+	    to creating a Cygwin symlink file (or in case of MSys:
+	    try to copy the (non-existing) target, which will of
+	    course fail). */
+	  SetLastError (ERROR_FILE_NOT_FOUND);
+	  return -1;
+	}
     }
   /* Don't allow native symlinks to Cygwin special files.  However, the
      caller shoud know because this case shouldn't be covered by the
@@ -2112,7 +2138,6 @@ symlink_native (const char *oldpath, path_conv &win32_newpath)
 	final_oldpath->Buffer[1] = L'\\';
     }
   /* Try to create native symlink. */
-  flags = win32_oldpath.isdir () ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
   if (wincap.has_unprivileged_createsymlink ())
     flags |= SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
   if (!CreateSymbolicLinkW (final_newpath->Buffer, final_oldpath->Buffer,
@@ -2706,7 +2731,7 @@ symlink_info::check_shortcut (HANDLE h)
       if (*(PWCHAR) cp == 0xfeff)	/* BOM */
 	{
 	  char *tmpbuf = tp.c_get ();
-	  if (sys_wcstombs (tmpbuf, NT_MAX_PATH, (PWCHAR) (cp + 2))
+	  if (sys_wcstombs_path (tmpbuf, NT_MAX_PATH, (PWCHAR) (cp + 2))
 	      > SYMLINK_MAX)
 	    return 0;
 	  res = posixify (tmpbuf);
@@ -2787,7 +2812,7 @@ symlink_info::check_sysfile (HANDLE h)
 	  else
 	    srcbuf += 2;
 	  char *tmpbuf = tp.c_get ();
-	  if (sys_wcstombs (tmpbuf, NT_MAX_PATH, (PWCHAR) srcbuf)
+	  if (sys_wcstombs_path (tmpbuf, NT_MAX_PATH, (PWCHAR) srcbuf)
 	      > SYMLINK_MAX)
 	    debug_printf ("symlink string too long");
 	  else
@@ -3055,8 +3080,8 @@ symlink_info::check_reparse_point (HANDLE h, bool remote)
   path_flags (path_flags () | ret);
   if (ret & PATH_SYMLINK)
     {
-      sys_wcstombs (srcbuf, SYMLINK_MAX + 7, symbuf.Buffer,
-		    symbuf.Length / sizeof (WCHAR));
+      sys_wcstombs_path (srcbuf, SYMLINK_MAX + 7, symbuf.Buffer,
+		         symbuf.Length / sizeof (WCHAR));
       /* A symlink is never a directory. */
       fileattr (fileattr () & ~FILE_ATTRIBUTE_DIRECTORY);
       return posixify (srcbuf);
@@ -3090,7 +3115,7 @@ symlink_info::check_nfs_symlink (HANDLE h)
     {
       PWCHAR spath = (PWCHAR)
 		     (pffei->EaName + pffei->EaNameLength + 1);
-      res = sys_wcstombs (contents, SYMLINK_MAX + 1,
+      res = sys_wcstombs_path (contents, SYMLINK_MAX + 1,
 			  spath, pffei->EaValueLength);
       path_flags (path_flags () | PATH_SYMLINK);
     }
@@ -4289,7 +4314,7 @@ cygwin_conv_path (cygwin_conv_path_t what, const void *from, void *to,
 	      }
 	    PUNICODE_STRING up = p.get_nt_native_path ();
 	    buf = tp.c_get ();
-	    sys_wcstombs (buf, NT_MAX_PATH,
+	    sys_wcstombs_path (buf, NT_MAX_PATH,
 			  up->Buffer, up->Length / sizeof (WCHAR));
 	    /* Convert native path to standard DOS path. */
 	    if (!strncmp (buf, "\\??\\", 4))
@@ -4302,11 +4327,11 @@ cygwin_conv_path (cygwin_conv_path_t what, const void *from, void *to,
 	      {
 		/* Device name points to somewhere else in the NT namespace.
 		   Use GLOBALROOT prefix to convert to Win32 path. */
-		char *p = buf + sys_wcstombs (buf, NT_MAX_PATH,
+		char *p = buf + sys_wcstombs_path (buf, NT_MAX_PATH,
 					      ro_u_globalroot.Buffer,
 					      ro_u_globalroot.Length
 					      / sizeof (WCHAR));
-		sys_wcstombs (p, NT_MAX_PATH - (p - buf),
+		sys_wcstombs_path (p, NT_MAX_PATH - (p - buf),
 			      up->Buffer, up->Length / sizeof (WCHAR));
 	      }
 	    lsiz = strlen (buf) + 1;
@@ -4618,8 +4643,8 @@ cygwin_conv_path_list (cygwin_conv_path_t what, const void *from, void *to,
   switch (what & CCP_CONVTYPE_MASK)
     {
     case CCP_WIN_W_TO_POSIX:
-      if (!sys_wcstombs_alloc (&winp, HEAP_NOTHEAP, (const wchar_t *) from,
-			       (size_t) -1))
+      if (!sys_wcstombs_alloc_path (&winp, HEAP_NOTHEAP,
+			      (const wchar_t *) from, (size_t) -1))
 	return -1;
       what = (what & ~CCP_CONVTYPE_MASK) | CCP_WIN_A_TO_POSIX;
       from = (const void *) winp;
@@ -5405,9 +5430,9 @@ cwdstuff::get_error_desc () const
 void
 cwdstuff::reset_posix (wchar_t *w_cwd)
 {
-  size_t len = sys_wcstombs (NULL, (size_t) -1, w_cwd);
+  size_t len = sys_wcstombs_path (NULL, (size_t) -1, w_cwd);
   posix = (char *) crealloc_abort (posix, len + 1);
-  sys_wcstombs (posix, len + 1, w_cwd);
+  sys_wcstombs_path (posix, len + 1, w_cwd);
 }
 
 char *
@@ -5432,7 +5457,7 @@ cwdstuff::get (char *buf, int need_posix, int with_chroot, unsigned ulen)
   if (!need_posix)
     {
       tocopy = tp.c_get ();
-      sys_wcstombs (tocopy, NT_MAX_PATH, win32.Buffer,
+      sys_wcstombs_path (tocopy, NT_MAX_PATH, win32.Buffer,
 		    win32.Length / sizeof (WCHAR));
     }
   else

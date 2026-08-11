@@ -327,7 +327,17 @@ dtable::init_std_file_from_handle (int fd, HANDLE handle)
 	dev.parse (myself->ctty);
       else
 	{
-	  dev.parse (FH_CONSOLE);
+	  /* Check whether the inherited console is actually a pseudo
+	     console bridging a pty.  This happens when our non-Cygwin
+	     parent was itself spawned by a Cygwin process from a pty
+	     (e.g. bash spawning git.exe which then spawns vim).  In
+	     that case, connect to the pty slave instead of treating
+	     the handle as a real console. */
+	  int pcon_minor = cygwin_shared->tty.find_pcon_pty ();
+	  if (pcon_minor >= 0)
+	    dev.parse (FHDEV (DEV_PTYS_MAJOR, pcon_minor));
+	  else
+	    dev.parse (FH_CONSOLE);
 	  CloseHandle (handle);
 	  handle = INVALID_HANDLE_VALUE;
 	}
@@ -1027,7 +1037,7 @@ handle_to_fn (HANDLE h, char *posix_fn)
       if (wcsncasecmp (w32, DEVICE_PREFIX, DEVICE_PREFIX_LEN) != 0
 	  || !QueryDosDeviceW (NULL, fnbuf, sizeof (fnbuf) / sizeof (WCHAR)))
 	{
-	  sys_wcstombs (posix_fn, NT_MAX_PATH, w32, w32len);
+	  sys_wcstombs_path (posix_fn, NT_MAX_PATH, w32, w32len);
 	  return false;
 	}
 

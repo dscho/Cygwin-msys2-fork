@@ -223,6 +223,84 @@ atexit_func (void)
     }
 }
 
+void
+fhandler_pty_slave::req_fixup_pcon_state (void)
+{
+  ULONGLONG deadline = GetTickCount64 () + 3000;
+  while (true)
+    {
+      WaitForSingleObject (input_mutex, mutex_timeout);
+      if (!get_ttyp ()->pcon_start_pid)
+	break;
+      /* Another request is on going. */
+      ReleaseMutex (input_mutex);
+      if (GetTickCount64 () > deadline)
+	/* A previous requester is stuck; give up this sync rather than
+	   spin forever. */
+	return;
+      yield ();
+    }
+
+  DWORD n;
+  /* indicates that this "ESC[6n" is just for fixing-up cursor position */
+  get_ttyp ()->req_fixup_pcon_cur_pos = true;
+  get_ttyp ()->req_xfer_input = true; /* indicates that this "ESC[6n"
+					 is just for transfer input */
+  get_ttyp ()->pcon_start = true;
+  get_ttyp ()->pcon_start_pid = myself->pid;
+  WriteFile (get_output_handle (), "\033[6n", 4, &n, NULL);
+  ReleaseMutex (input_mutex);
+  deadline = GetTickCount64 () + 3000;
+  while (get_ttyp ()->pcon_start_pid && GetTickCount64 () <= deadline)
+    /* wait for completion of fixing-up in master::write(). */
+    yield ();
+  /* If the master never answered (e.g. the terminal is going away),
+     clear our own request so a stale pcon_start_pid cannot wedge the
+     next requester. */
+  if (get_ttyp ()->pcon_start_pid == (pid_t) myself->pid)
+    {
+      WaitForSingleObject (input_mutex, mutex_timeout);
+      if (get_ttyp ()->pcon_start_pid == (pid_t) myself->pid)
+	{
+	  get_ttyp ()->req_fixup_pcon_cur_pos = false;
+	  get_ttyp ()->req_xfer_input = false;
+	  get_ttyp ()->pcon_start = false;
+	  get_ttyp ()->pcon_start_pid = 0;
+	}
+      ReleaseMutex (input_mutex);
+    }
+}
+
+void
+fhandler_pty_master::fixup_pcon_cursor_position (int x, int y)
+{
+  /* A malformed or out-of-range reply must not be turned into a wrapped
+     negative COORD. */
+  if (x < 1 || y < 1 || x > 0x7fff || y > 0x7fff)
+    return;
+  HANDLE pcon_owner = OpenProcess (PROCESS_DUP_HANDLE, FALSE,
+				   get_ttyp ()->nat_pipe_owner_pid);
+  if (!pcon_owner)
+    /* The nat-pipe owner is gone; nothing to sync to. */
+    return;
+  HANDLE h_pcon_out = NULL;
+  if (!DuplicateHandle (pcon_owner, get_ttyp ()->h_pcon_out,
+			GetCurrentProcess (), &h_pcon_out,
+			0, TRUE, DUPLICATE_SAME_ACCESS))
+    {
+      CloseHandle (pcon_owner);
+      return;
+    }
+  CloseHandle (pcon_owner);
+  DWORD target_pid = get_ttyp ()->nat_pipe_owner_pid;
+  DWORD resume_pid =
+    fhandler_pty_common::attach_console_temporarily (target_pid);
+  COORD cur_pos = {(SHORT) (x - 1), (SHORT) (y - 1)};
+  SetConsoleCursorPosition (h_pcon_out, cur_pos);
+  fhandler_pty_common::resume_from_temporarily_attach (resume_pid);
+  CloseHandle (h_pcon_out);
+}
+
 #define DEF_HOOK(name) static __typeof__ (name) *name##_Orig
 /* CreateProcess() is hooked for GDB etc. */
 DEF_HOOK (CreateProcessA);
@@ -418,6 +496,14 @@ fhandler_pty_master::discard_input ()
   if (!get_ttyp ()->pcon_activated)
     while (::bytes_available (bytes_in_pipe, from_master_nat) && bytes_in_pipe)
       ReadFile (from_master_nat, buf, sizeof(buf), &n, NULL);
+  else
+    {
+      DWORD target_pid = get_ttyp ()->nat_pipe_owner_pid;
+      DWORD resume_pid =
+	fhandler_pty_common::attach_console_temporarily (target_pid);
+      FlushConsoleInputBuffer (h_pcon_in_dupped);
+      fhandler_pty_common::resume_from_temporarily_attach (resume_pid);
+    }
   get_ttyp ()->discard_input = true;
   ReleaseMutex (input_mutex);
 }
@@ -973,6 +1059,39 @@ fhandler_pty_slave::open (int flags, mode_t)
       release_attach_mutex ();
     }
 
+  if (get_ttyp ()->pcon_activated)
+    {
+      HANDLE pcon_owner = OpenProcess (PROCESS_DUP_HANDLE, FALSE,
+				       get_ttyp ()->nat_pipe_owner_pid);
+      if (pcon_owner)
+	{
+	  HANDLE new_in = NULL, new_out = NULL;
+	  bool ok_in = DuplicateHandle (pcon_owner, get_ttyp ()->h_pcon_in,
+				       GetCurrentProcess (), &new_in,
+				       0, TRUE, DUPLICATE_SAME_ACCESS);
+	  bool ok_out = DuplicateHandle (pcon_owner, get_ttyp ()->h_pcon_out,
+				        GetCurrentProcess (), &new_out,
+				        0, TRUE, DUPLICATE_SAME_ACCESS);
+	  if (ok_in && ok_out)
+	    {
+	      /* Replace these before open_with_arch() copies them into the
+		 archetype shared by all pty slave fhandlers. */
+	      CloseHandle (get_handle_nat ());
+	      CloseHandle (get_output_handle_nat ());
+	      set_handle_nat (new_in);
+	      set_output_handle_nat (new_out);
+	    }
+	  else
+	    {
+	      if (new_in)
+		CloseHandle (new_in);
+	      if (new_out)
+		CloseHandle (new_out);
+	    }
+	  CloseHandle (pcon_owner);
+	}
+    }
+
   set_open_status ();
   return 1;
 
@@ -1005,6 +1124,9 @@ fhandler_pty_slave::cleanup ()
   fhandler_pty_slave *arch = (fhandler_pty_slave *) archetype ? : this;
   while (arch->num_reader)
     mask_switch_to_nat_pipe (false, false);
+
+  if (get_ttyp ()->pcon_activated && get_ttyp ()->getpgid () == myself->pgid)
+    req_fixup_pcon_state ();
 
   /* This used to always call fhandler_pty_common::close when we were execing
      but that caused multiple closes of the handles associated with this pty.
@@ -2311,10 +2433,21 @@ fhandler_pty_master::write (const void *ptr, size_t len)
 	    state = 2;
 	  if (state == 2)
 	    {
-	      /* req_xfer_input is true if "ESC[6n" was sent just for
+	      /* req_fixup_pcon_cur_pos is true if "ESC[6n" was sent
+		 for requesting cursor-position-fixup that is needed
+		 when a non-cygwin app executes a cygwin app and the
+		 cygwin app exits.
+		 req_xfer_input is true if "ESC[6n" was sent just for
 		 triggering transfer_input() in master. In this case,
 		 the response sequence should not be written. */
-	      if (!get_ttyp ()->req_xfer_input)
+	      if (get_ttyp ()->req_fixup_pcon_cur_pos)
+		{
+		  int x, y;
+		  if (sscanf (wpbuf, "\033[%d;%dR", &y, &x) == 2)
+		    fixup_pcon_cursor_position (x, y);
+		  get_ttyp ()->req_fixup_pcon_cur_pos = false;
+		}
+	      else if (!get_ttyp ()->req_xfer_input)
 		WriteFile (to_slave_nat, wpbuf, ixput, &n, NULL);
 	      ixput = 0;
 	      state = 0;
@@ -2428,7 +2561,8 @@ fhandler_pty_master::write (const void *ptr, size_t len)
       for (size_t i = 0, j = 0; i < len; i++)
 	{
 	  process_sig_state r = process_sigs (buf[i], get_ttyp (), this);
-	  if (r != done_with_debugger)
+	  if (r != done_with_debugger &&
+	      (r != signalled || (ti.c_lflag & NOFLSH) || buf[i] == '\003'))
 	    {
 	      char c = buf[i];
 	      /* Workaround for pseudo console in Windows 11 */
@@ -3934,8 +4068,13 @@ fhandler_pty_slave::close_pseudoconsole (tty *ttyp, DWORD force_switch_to)
 	  ttyp->pcon_activated = false;
 	  ttyp->switch_to_nat_pipe = false;
 	  ttyp->nat_pipe_owner_pid = 0;
-	  ttyp->pcon_start = false;
-	  ttyp->pcon_start_pid = 0;
+	  /* Safety net: if a req_fixup_pcon_state() requester died without
+	     clearing its slot, do not leave pcon_start_pid set forever. */
+	  if (ttyp->pcon_start_pid == myself->pid)
+	    {
+	      ttyp->pcon_start = false;
+	      ttyp->pcon_start_pid = 0;
+	    }
 	}
       if (ttyp->pcon_handle_ready_event)
 	{
