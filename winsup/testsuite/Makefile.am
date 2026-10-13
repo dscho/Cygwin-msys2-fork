@@ -37,6 +37,7 @@ check_PROGRAMS = \
 	winsup.api/crlf \
 	winsup.api/devdsp \
 	winsup.api/devzero \
+	winsup.api/exec-token \
 	winsup.api/iospeed \
 	winsup.api/mmaptest01 \
 	winsup.api/mmaptest02 \
@@ -328,6 +329,7 @@ LDADD = $(builddir)/libltp.a $(builddir)/../cygwin/binmode.o $(LDADD_FOR_TESTDLL
 
 # additional flags for specific test executables
 winsup_api_devdsp_LDADD = -lwinmm $(LDADD)
+winsup_api_exec_token_LDADD = -lntdll -ladvapi32 $(LDADD)
 
 # all tests
 TESTS = $(check_PROGRAMS) \
